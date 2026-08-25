@@ -2,7 +2,7 @@
 
 Live TUI dashboard of Claude Code / Codex / pi agents running in [cmux](https://cmux.io).
 
-Shows every agent, its state (**needs you** / running / done / idle), and lets you:
+Shows every agent, its state (needs you / running / done / idle), and lets you:
 
 - jump to an agent's terminal with **Enter**, a mouse click, or a number key (1–9, or type two digits)
 - close an agent's terminal tab (**x** or click `✕tab`) or its whole workspace (**w** or click `✕ws`), with a y/N confirm
