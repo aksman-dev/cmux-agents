@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""cmux-agents — live dashboard of Claude Code / Codex agents running in cmux.
+
+Shows every agent, its state (needs you / running / done / idle), and lets you
+jump to its terminal with Enter, a mouse click, or a number key. Each row also
+has ✕tab / ✕ws buttons (keys: x / w) to close the agent's terminal tab or its
+whole workspace, with a y/N confirm.
+
+Data sources:
+  - `cmux tree --all`           surface <-> tty <-> workspace/window mapping
+  - `ps`                        live claude/codex processes (tty -> session id)
+  - `cmux rpc feed.list`        per-session events (pending permissions, stop)
+  - `cmux rpc notification.list` waiting/completed notifications per surface
+
+Run with --once for a plain-text snapshot (no TUI).
+"""
+
+import curses
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CMUX = os.environ.get("CMUX_BIN", "cmux")
+LOCK = os.path.expanduser("~/.local/state/cmux/cmux-agents.lock")
+REFRESH_SECS = 3.0
+
+STATUS_ORDER = {"NEEDS YOU": 0, "RUNNING": 1, "DONE": 2, "IDLE": 3, "EXITED": 4}
+
+
+def sh(args, timeout=10):
+    env = dict(os.environ, CMUX_QUIET="1")
+    try:
+        return subprocess.run(
+            [CMUX] + args, capture_output=True, text=True, timeout=timeout, env=env
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def rpc(method, params=None):
+    args = ["rpc", method] + ([json.dumps(params)] if params is not None else [])
+    r = sh(args)
+    if r is None or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+# ---------------------------------------------------------------- gathering
+
+WIN_RE = re.compile(r"^window (window:\d+) ([0-9A-Fa-f-]{36})")
+WS_RE = re.compile(r"workspace (workspace:\d+) ([0-9A-Fa-f-]{36}) \"(.*)\"")
+SURF_RE = re.compile(
+    r"surface (surface:\d+) ([0-9A-Fa-f-]{36}) \[terminal\] \"(.*)\"(.*)$"
+)
+TTY_RE = re.compile(r"tty=(\S+)")
+SID_RE = re.compile(r"--session-id ([0-9a-f-]{36})")
+
+
+def cmux_surfaces():
+    """Parse `cmux tree --all` into a list of terminal surfaces with ttys."""
+    r = sh(["tree", "--all", "--id-format", "both"])
+    if r is None or r.returncode != 0:
+        return []
+    surfaces = []
+    win = ws = None
+    for line in r.stdout.splitlines():
+        m = WIN_RE.match(line)
+        if m:
+            win = {"ref": m.group(1), "id": m.group(2)}
+            continue
+        m = WS_RE.search(line)
+        if m:
+            ws = {"ref": m.group(1), "id": m.group(2), "title": m.group(3)}
+            continue
+        m = SURF_RE.search(line)
+        if m and win and ws:
+            tail = m.group(4)
+            tty = TTY_RE.search(tail)
+            surfaces.append(
+                {
+                    "ref": m.group(1),
+                    "id": m.group(2),
+                    "title": m.group(3),
+                    "tty": tty.group(1) if tty else None,
+                    "ws_ref": ws["ref"],
+                    "ws_id": ws["id"],
+                    "ws_title": ws["title"],
+                    "win_ref": win["ref"],
+                    "win_id": win["id"],
+                }
+            )
+    return surfaces
+
+
+def agent_processes():
+    """tty -> live claude/codex process info."""
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,tty=,pcpu=,args="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, tty, pcpu, args = parts
+        if not tty.startswith("tty"):
+            continue
+        exe = args.split()[0].rsplit("/", 1)[-1]
+        if exe not in ("claude", "codex", "pi"):
+            continue
+        m = SID_RE.search(args)
+        procs.setdefault(
+            tty,
+            {
+                "pid": int(pid),
+                "kind": exe,
+                "cpu": float(pcpu),
+                "sid": m.group(1) if m else None,
+            },
+        )
+    return procs
+
+
+def parse_ts(s):
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+# ------------------------------------------------------------- pi sessions
+#
+# pi doesn't tag its process with a session id or feed events into cmux, so
+# identify sessions by pairing each pi process (start time + cwd) with its
+# session file in ~/.pi/agent/sessions/<encoded-cwd>/<created-at>_<id>.jsonl.
+# The first user message becomes the row title, the file mtime the row age.
+
+PI_SESSIONS_DIR = os.path.expanduser("~/.pi/agent/sessions")
+PI_FILE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_")
+ETIME_RE = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$")
+
+
+def pi_proc_meta(pids):
+    """pid -> {'start_ts': float, 'cwd': str} for pi processes."""
+    meta = {}
+    if not pids:
+        return meta
+    now = time.time()
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=,etime=", "-p", ",".join(map(str, pids))],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            m = ETIME_RE.match(parts[1])
+            if not m:
+                continue
+            d, h, mi, s = (int(x) if x else 0 for x in m.groups())
+            meta[int(parts[0])] = {"start_ts": now - (((d * 24 + h) * 60 + mi) * 60 + s), "cwd": ""}
+        out = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(map(str, pids))],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        pid = None
+        for line in out.splitlines():
+            if line.startswith("p"):
+                pid = int(line[1:])
+            elif line.startswith("n") and pid in meta:
+                meta[pid]["cwd"] = line[1:]
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return meta
+
+
+def pi_session_files(cwd):
+    """Session files for a cwd, as [(created_ts, mtime, path)]."""
+    want = cwd.replace("/", "-").strip("-")
+    files = []
+    try:
+        dirs = os.listdir(PI_SESSIONS_DIR)
+    except OSError:
+        return files
+    for d in dirs:
+        if d.strip("-") != want:
+            continue
+        droot = os.path.join(PI_SESSIONS_DIR, d)
+        for f in os.listdir(droot):
+            m = PI_FILE_TS_RE.match(f)
+            if not m:
+                continue
+            created = parse_ts(f"{m.group(1)}T{m.group(2)}:{m.group(3)}:{m.group(4)}.{m.group(5)}Z")
+            path = os.path.join(droot, f)
+            try:
+                files.append((created, os.stat(path).st_mtime, path))
+            except OSError:
+                continue
+    return files
+
+
+def pi_first_user_message(path, limit=200):
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = o.get("message") or {}
+                if o.get("type") != "message" or msg.get("role") != "user":
+                    continue
+                c = msg.get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                text = one_line(str(c or ""), limit)
+                if text:
+                    return text
+    except OSError:
+        pass
+    return None
+
+
+def pi_session_map(procs):
+    """tty -> {'title', 'ts', 'cwd'} for running pi processes."""
+    pi_procs = {tty: p for tty, p in procs.items() if p["kind"] == "pi"}
+    meta = pi_proc_meta([p["pid"] for p in pi_procs.values()])
+    by_cwd = {}
+    for tty, p in pi_procs.items():
+        m = meta.get(p["pid"])
+        if m and m["cwd"]:
+            by_cwd.setdefault(m["cwd"], []).append((m["start_ts"], tty))
+    result = {}
+    for cwd, entries in by_cwd.items():
+        entries.sort()  # oldest process first
+        # newest N files by activity, then pair oldest-created <-> oldest-started
+        files = sorted(pi_session_files(cwd), key=lambda x: -x[1])[: len(entries)]
+        files.sort()
+        for (start_ts, tty), (created, mtime, path) in zip(entries, files):
+            title = pi_first_user_message(path)
+            result[tty] = {
+                "title": title,
+                "ts": mtime,
+                "cwd": cwd,
+            }
+    return result
+
+
+def feed_state():
+    """workstream_id -> (latest item, pending items, cwd)."""
+    d = rpc("feed.list") or {}
+    last, pending, cwds = {}, {}, {}
+    for it in d.get("items", []):
+        wsid = it.get("workstream_id") or ""
+        last[wsid] = it  # items are chronological
+        if it.get("cwd"):
+            cwds[wsid] = it["cwd"]
+        if it.get("status") == "pending":
+            pending.setdefault(wsid, []).append(it)
+    return last, pending, cwds
+
+
+def notif_state():
+    """surface_id -> most recent notification."""
+    d = rpc("notification.list") or {}
+    per = {}
+    for n in d.get("notifications", []):  # newest first
+        sid = n.get("surface_id")
+        if sid and sid not in per:
+            per[sid] = n
+    return per
+
+
+def is_spinner(title):
+    return bool(title) and 0x2800 <= ord(title[0]) <= 0x28FF
+
+
+def clean_title(title):
+    return title.lstrip("⠀⠁⠂⠄⠈⠐⠠⡀⢀✳✶⚠ ").strip() or title
+
+
+def one_line(s, limit=200):
+    return " ".join((s or "").split())[:limit]
+
+
+def build_rows():
+    surfaces = cmux_surfaces()
+    procs = agent_processes()
+    feed_last, feed_pending, feed_cwds = feed_state()
+    notifs = notif_state()
+    pi_map = pi_session_map(procs)
+
+    rows = []
+    seen_ttys = set()
+    for surf in surfaces:
+        proc = procs.get(surf["tty"]) if surf["tty"] else None
+        if not proc:
+            continue
+        seen_ttys.add(surf["tty"])
+        wskey = f"{proc['kind']}-{proc['sid']}" if proc.get("sid") else None
+        last = feed_last.get(wskey) if wskey else None
+        notif = notifs.get(surf["id"])
+        status, detail = agent_status(surf, proc, last, feed_pending.get(wskey), notif)
+        ts = max(
+            parse_ts(last.get("created_at")) if last else 0.0,
+            parse_ts(notif.get("created_at")) if notif else 0.0,
+        )
+        pi = pi_map.get(surf["tty"], {})
+        # pi has no feed events; a freshly-appended session file means activity
+        if status == "IDLE" and pi.get("ts") and time.time() - pi["ts"] < 60:
+            status = "RUNNING"
+        rows.append(
+            {
+                "surf": surf,
+                "kind": proc["kind"],
+                "status": status,
+                "detail": one_line(detail),
+                "title": pi.get("title") or clean_title(surf["title"]),
+                "cwd": pi.get("cwd") or feed_cwds.get(wskey, ""),
+                "ts": pi.get("ts") or ts,
+                "in_cmux": True,
+            }
+        )
+
+    # agents running outside cmux (plain Terminal.app etc.)
+    for tty, proc in procs.items():
+        if tty in seen_ttys:
+            continue
+        pi = pi_map.get(tty, {})
+        rows.append(
+            {
+                "surf": None,
+                "kind": proc["kind"],
+                "status": "IDLE",
+                "detail": f"not in cmux ({tty}, pid {proc['pid']})",
+                "title": pi.get("title") or f"{proc['kind']} on {tty}",
+                "cwd": pi.get("cwd", ""),
+                "ts": pi.get("ts") or 0.0,
+                "in_cmux": False,
+            }
+        )
+
+    rows.sort(key=lambda r: (STATUS_ORDER.get(r["status"], 9), r["surf"] is None,
+                             r["surf"]["win_ref"] if r["surf"] else "", -r["ts"]))
+    return rows
+
+
+def agent_status(surf, proc, last, pending, notif):
+    """Return (status, detail) for one agent surface."""
+    if pending:
+        it = pending[-1]
+        what = it.get("title") or it.get("tool_name") or it.get("kind") or "approval"
+        return "NEEDS YOU", f"approve: {what}"
+    if is_spinner(surf["title"]):
+        detail = ""
+        if last and last.get("kind") == "toolUse":
+            detail = f"→ {last.get('title') or last.get('tool_name') or ''}"
+        return "RUNNING", detail
+    last_kind = last.get("kind") if last else None
+    last_ts = parse_ts(last.get("created_at")) if last else 0.0
+    if notif and not notif.get("is_read"):
+        blob = (notif.get("subtitle") or "") + " " + (notif.get("body") or "")
+        if "wait" in blob.lower() and parse_ts(notif.get("created_at")) >= last_ts:
+            return "NEEDS YOU", notif.get("body") or "waiting for your input"
+    if last_kind == "stop":
+        detail = "turn finished"
+        if notif and (notif.get("subtitle") or "").startswith("Completed"):
+            detail = notif.get("body") or detail
+        return "DONE", detail
+    # Mid-turn feed events only count as running while fresh; old sessions
+    # whose stop event was evicted from the 2000-item feed ring land here.
+    if last_kind in ("toolUse", "toolResult", "userPrompt", "sessionStart"):
+        if time.time() - last_ts < 120:
+            return "RUNNING", ""
+    if notif and parse_ts(notif.get("created_at")) >= last_ts:
+        sub = notif.get("subtitle") or ""
+        if sub.startswith("Completed"):
+            return "DONE", notif.get("body") or "turn finished"
+        if sub.startswith("Waiting"):
+            return "DONE", "waiting for your input"
+    # Agents with no cmux feed integration (e.g. pi): infer activity from CPU.
+    if last is None and proc and proc["cpu"] > 10.0:
+        return "RUNNING", f"cpu {proc['cpu']:.0f}%"
+    return "IDLE", ""
+
+
+# ---------------------------------------------------------------- actions
+
+def focus_row(row):
+    if not row or not row["in_cmux"]:
+        return False
+    surf = row["surf"]
+    sh(["focus-window", "--window", surf["win_ref"]])
+    rpc("surface.focus", {"surface_id": surf["id"]})
+    return True
+
+
+def close_row(row, kind):
+    """Close the row's terminal tab ("tab") or its whole workspace ("ws")."""
+    if not row or not row["in_cmux"]:
+        return False
+    surf = row["surf"]
+    if kind == "ws":
+        r = sh(["close-workspace", "--workspace", surf["ws_id"],
+                "--window", surf["win_id"]])
+    else:
+        r = sh(["close-surface", "--surface", surf["id"],
+                "--workspace", surf["ws_id"], "--window", surf["win_id"]])
+    return r is not None and r.returncode == 0
+
+
+def ensure_single_instance():
+    """If another dashboard is already open in cmux, jump to it and close this one."""
+    my_ws = os.environ.get("CMUX_WORKSPACE_ID")
+    if not my_ws:
+        return
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    try:
+        with open(LOCK) as f:
+            other = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        other = None
+    if other and other.get("ws") != my_ws:
+        try:
+            os.kill(int(other["pid"]), 0)  # still alive?
+            if other.get("win"):
+                sh(["focus-window", "--window", other["win"]])
+            if other.get("surface"):
+                rpc("surface.focus", {"surface_id": other["surface"]})
+            sh(["close-workspace", "--workspace", my_ws])
+            sys.exit(0)
+        except (ProcessLookupError, ValueError, PermissionError):
+            pass  # stale lock; take over
+    win = None
+    ident = rpc("surface.current") or {}
+    win = ident.get("window_id")
+    with open(LOCK, "w") as f:
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "ws": my_ws,
+                "surface": os.environ.get("CMUX_SURFACE_ID"),
+                "win": win,
+            },
+            f,
+        )
+    sh(["workspace-action", "--action", "pin", "--workspace", my_ws])
+
+
+def release_lock():
+    try:
+        with open(LOCK) as f:
+            if json.load(f).get("pid") == os.getpid():
+                os.unlink(LOCK)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+# ---------------------------------------------------------------- rendering
+
+BADGE = {
+    "NEEDS YOU": ("●", 1),
+    "RUNNING": ("▶", 2),
+    "DONE": ("✔", 3),
+    "IDLE": ("○", 4),
+    "EXITED": ("○", 4),
+}
+KIND_LABEL = {"claude": "claude", "codex": "codex ", "pi": "pi    "}
+
+
+def age_str(ts):
+    if not ts:
+        return ""
+    s = int(time.time() - ts)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+BTNS = " ✕tab  ✕ws "  # tab zone [btn_x, btn_x+6), ws zone [btn_x+6, btn_x+11)
+CLOSE_LABEL = {"tab": "terminal tab", "ws": "workspace"}
+
+
+def row_line(i, r):
+    return f" {i + 1:>2} {BADGE[r['status']][0]} {r['status']:<9} {KIND_LABEL.get(r['kind'], r['kind']):<6} {age_str(r['ts']):>6}  {r['title']}"
+
+
+def btn_col(rows, w):
+    """Column where the ✕tab/✕ws buttons start: just past the longest row."""
+    longest = max((len(row_line(i, r)) for i, r in enumerate(rows)), default=0)
+    return max(20, min(longest + 2, w - 12))
+
+
+def draw(stdscr, rows, selected, msg, confirm=None):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    counts = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    header = " AGENTS  " + "  ".join(
+        f"{k.lower()}:{v}" for k, v in sorted(counts.items(), key=lambda kv: STATUS_ORDER.get(kv[0], 9))
+    )
+    stdscr.addnstr(0, 0, header.ljust(w - 1), w - 1, curses.color_pair(5) | curses.A_BOLD)
+
+    top = 2
+    for i, r in enumerate(rows):
+        y = top + i
+        if y >= h - 2:
+            break
+        badge, cp = BADGE[r["status"]]
+        attr = curses.A_REVERSE if i == selected else 0
+        line1 = row_line(i, r)
+        row_attr = curses.color_pair(cp) | attr | (curses.A_BOLD if r["status"] == "NEEDS YOU" else 0)
+        stdscr.addnstr(y, 0, line1.ljust(w - 1), w - 1, row_attr)
+        if r["in_cmux"] and w > 40:
+            try:
+                stdscr.addnstr(y, btn_col(rows, w), BTNS, 11, attr | (0 if i == selected else curses.A_DIM))
+            except curses.error:
+                pass
+        if i == selected and r["detail"]:
+            pass  # detail shown in footer for the selected row
+
+    sel = rows[selected] if rows and 0 <= selected < len(rows) else None
+    footer_y = h - 2
+    if sel:
+        detail = sel["detail"] or sel["cwd"]
+        stdscr.addnstr(footer_y, 0, f" {detail}".ljust(w - 1), w - 1, curses.A_DIM)
+    keys = " ⏎/click jump   ✕/x close tab   w close workspace   r refresh   q quit "
+    if confirm:
+        kind, ci = confirm
+        title = rows[ci]["title"] if 0 <= ci < len(rows) else "?"
+        prompt = f" close {CLOSE_LABEL[kind]} of \"{one_line(title, 60)}\"? y/N "
+        stdscr.addnstr(h - 1, 0, prompt.ljust(w - 1), w - 1, curses.color_pair(1) | curses.A_BOLD)
+    else:
+        stdscr.addnstr(h - 1, 0, (msg or keys).ljust(w - 1), w - 1, curses.color_pair(5))
+    stdscr.refresh()
+
+
+def tui(stdscr):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_RED, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_CYAN, -1)
+    curses.init_pair(4, curses.COLOR_WHITE, -1)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    curses.mouseinterval(0)
+    stdscr.timeout(250)
+
+    rows = build_rows()
+    selected, last_fetch, msg = 0, time.time(), ""
+    digits, digits_at = "", 0.0
+    confirm = None  # ("tab"|"ws", row index) awaiting y/N
+
+    def jump(i):
+        nonlocal selected, msg
+        if 0 <= i < len(rows):
+            selected = i
+            if not focus_row(rows[i]):
+                msg = " agent is not in a cmux terminal "
+
+    def arm_close(kind, i):
+        nonlocal confirm, selected, msg
+        if not (0 <= i < len(rows)):
+            return
+        selected = i
+        if rows[i]["in_cmux"]:
+            confirm = (kind, i)
+        else:
+            msg = " agent is not in a cmux terminal "
+
+    while True:
+        draw(stdscr, rows, selected, msg, confirm)
+        ch = stdscr.getch()
+        if confirm is not None:
+            if ch == -1:
+                continue
+            if ch == curses.KEY_MOUSE:  # swallow press/release pairs
+                try:
+                    curses.getmouse()
+                except curses.error:
+                    pass
+                continue
+            kind, ci = confirm
+            confirm = None
+            if ch in (ord("y"), ord("Y")) and 0 <= ci < len(rows):
+                ok = close_row(rows[ci], kind)
+                msg = f" closed {CLOSE_LABEL[kind]} " if ok else f" failed to close {CLOSE_LABEL[kind]} "
+                time.sleep(0.3)  # let cmux settle before re-reading the tree
+                rows = build_rows()
+                last_fetch = time.time()
+                selected = min(selected, max(len(rows) - 1, 0))
+            continue
+        msg = ""
+        # a buffered digit fires once no second digit can follow it
+        if digits and (time.time() - digits_at > 0.5) and not (ord("0") <= ch <= ord("9")):
+            jump(int(digits) - 1)
+            digits = ""
+        if ch in (ord("q"), 27):
+            break
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            selected = min(selected + 1, max(len(rows) - 1, 0))
+        elif ch in (curses.KEY_UP, ord("k")):
+            selected = max(selected - 1, 0)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if digits:
+                jump(int(digits) - 1)
+                digits = ""
+            elif not focus_row(rows[selected] if rows else None):
+                msg = " agent is not in a cmux terminal "
+        elif ord("0") <= ch <= ord("9"):
+            if time.time() - digits_at > 0.5:
+                digits = ""
+            digits += chr(ch)
+            digits_at = time.time()
+            n = int(digits)
+            if n * 10 > len(rows) or len(digits) >= 2:  # no longer ambiguous
+                jump(n - 1)
+                digits = ""
+            else:
+                msg = f" jump: {digits}… "
+        elif ch == ord("x"):
+            arm_close("tab", selected)
+        elif ch == ord("w"):
+            arm_close("ws", selected)
+        elif ch == ord("r"):
+            rows = build_rows()
+            last_fetch = time.time()
+            selected = min(selected, max(len(rows) - 1, 0))
+        elif ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED):
+                i = my - 2
+                if 0 <= i < len(rows):
+                    _, w = stdscr.getmaxyx()
+                    bx = btn_col(rows, w)
+                    if rows[i]["in_cmux"] and bx <= mx < bx + 6:
+                        arm_close("tab", i)
+                    elif rows[i]["in_cmux"] and bx + 6 <= mx < bx + 11:
+                        arm_close("ws", i)
+                    else:
+                        selected = i
+                        if not focus_row(rows[i]):
+                            msg = " agent is not in a cmux terminal "
+        if confirm is None and time.time() - last_fetch >= REFRESH_SECS:
+            rows = build_rows()
+            last_fetch = time.time()
+            selected = min(selected, max(len(rows) - 1, 0))
+
+
+def main():
+    if "--once" in sys.argv:
+        for r in build_rows():
+            loc = r["surf"]["ws_ref"] if r["in_cmux"] else "outside-cmux"
+            print(f"{r['status']:<10} {r['kind']:<7} {age_str(r['ts']):>6}  {loc:<14} {r['title']}")
+            if r["detail"]:
+                print(f"{'':36}{r['detail'][:120]}")
+        return
+    if sh(["ping"]) is None:
+        sys.exit("cmux CLI not found (set CMUX_BIN or add cmux to PATH)")
+    # Leave whatever repo we were launched from, so cmux doesn't decorate the
+    # pinned dashboard workspace with that repo's branch/PR metadata. OSC 7
+    # covers shell-integration-based cwd tracking, chdir covers process-based.
+    home = os.path.expanduser("~")
+    os.chdir(home)
+    ensure_single_instance()
+    sys.stdout.write(f"\033]7;file://localhost{home}\007")
+    sys.stdout.write("\033]0;⌘ Agents\007")
+    sys.stdout.flush()
+    try:
+        curses.wrapper(tui)
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    main()
