@@ -141,20 +141,22 @@ def parse_ts(s):
         return 0.0
 
 
-# ------------------------------------------------------------- pi sessions
+# ------------------------------------- external sessions (pi, codex)
 #
-# pi doesn't tag its process with a session id or feed events into cmux, so
-# identify sessions by pairing each pi process (start time + cwd) with its
-# session file in ~/.pi/agent/sessions/<encoded-cwd>/<created-at>_<id>.jsonl.
-# The first user message becomes the row title, the file mtime the row age.
+# pi and codex don't tag their process with a session id or feed events into
+# cmux, so identify sessions by pairing each process (start time + cwd) with
+# its session file:
+#   pi     ~/.pi/agent/sessions/<encoded-cwd>/<created-at>_<id>.jsonl
+#   codex  ~/.codex/sessions/YYYY/MM/DD/rollout-<created-at>-<id>.jsonl
+# The first user prompt becomes the row title, the file mtime the row age.
 
 PI_SESSIONS_DIR = os.path.expanduser("~/.pi/agent/sessions")
 PI_FILE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_")
 ETIME_RE = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$")
 
 
-def pi_proc_meta(pids):
-    """pid -> {'start_ts': float, 'cwd': str} for pi processes."""
+def proc_meta(pids):
+    """pid -> {'start_ts': float, 'cwd': str}."""
     meta = {}
     if not pids:
         return meta
@@ -235,23 +237,179 @@ def pi_first_user_message(path, limit=200):
     return None
 
 
-def pi_session_map(procs):
-    """tty -> {'title', 'ts', 'cwd'} for running pi processes."""
-    pi_procs = {tty: p for tty, p in procs.items() if p["kind"] == "pi"}
-    meta = pi_proc_meta([p["pid"] for p in pi_procs.values()])
+# codex: top-level TUI sessions are rollout files whose first session_meta has
+# thread_source != "subagent"; subagent rollouts name their parent session, so
+# their mtime counts as parent activity. Titles come from ~/.codex/history.jsonl
+# (session_id -> first prompt), falling back to the rollout's first user message.
+
+CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+CODEX_HISTORY = os.path.expanduser("~/.codex/history.jsonl")
+CODEX_FILE_RE = re.compile(
+    r"^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-[0-9a-f-]{36}\.jsonl$"
+)
+
+_codex_meta_cache = {}  # path -> (is_top, sid, cwd); first lines never change
+_codex_titles_cache = {"mtime": None, "titles": {}}
+
+
+def codex_rollout_meta(path):
+    """(is_top_level_tui_session, session_id, cwd) from a rollout's first meta."""
+    if path in _codex_meta_cache:
+        return _codex_meta_cache[path]
+    try:
+        with open(path) as f:
+            for _ in range(5):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("type") != "session_meta":
+                    continue
+                p = o.get("payload") or {}
+                meta = (
+                    p.get("thread_source") != "subagent"
+                    and p.get("originator") == "codex-tui",
+                    p.get("session_id") or p.get("id"),  # parent sid for subagents
+                    p.get("cwd") or "",
+                )
+                _codex_meta_cache[path] = meta
+                return meta
+    except OSError:
+        pass
+    return None  # meta not written yet; retry next refresh
+
+
+def codex_session_files():
+    """cwd -> [(created, activity_mtime, path, sid)] for top-level sessions."""
+    try:
+        days = sorted(
+            os.path.join(m.path, d)
+            for y in os.scandir(CODEX_SESSIONS_DIR) if y.is_dir()
+            for m in os.scandir(y.path) if m.is_dir()
+            for d in os.listdir(m.path)
+        )[-14:]
+    except OSError:
+        return {}
+    tops, sub_mtime = {}, {}  # sid -> [created, mtime, path, cwd] / sid -> mtime
+    for droot in days:
+        try:
+            names = os.listdir(droot)
+        except OSError:
+            continue
+        for f in names:
+            m = CODEX_FILE_RE.match(f)
+            if not m:
+                continue
+            path = os.path.join(droot, f)
+            meta = codex_rollout_meta(path)
+            if not meta or not meta[1]:
+                continue
+            is_top, sid, cwd = meta
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+            if is_top:
+                created = time.mktime(tuple(int(x) for x in m.groups()) + (0, 0, -1))
+                tops[sid] = [created, mtime, path, cwd]
+            else:
+                sub_mtime[sid] = max(sub_mtime.get(sid, 0.0), mtime)
     by_cwd = {}
-    for tty, p in pi_procs.items():
+    for sid, (created, mtime, path, cwd) in tops.items():
+        activity = max(mtime, sub_mtime.get(sid, 0.0))
+        by_cwd.setdefault(cwd, []).append((created, activity, path, sid))
+    return by_cwd
+
+
+def codex_titles():
+    """session_id -> first user prompt, from history.jsonl."""
+    try:
+        mtime = os.stat(CODEX_HISTORY).st_mtime
+    except OSError:
+        return {}
+    if mtime != _codex_titles_cache["mtime"]:
+        titles = {}
+        try:
+            with open(CODEX_HISTORY) as f:
+                for line in f:
+                    try:
+                        o = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sid = o.get("session_id")
+                    if sid and sid not in titles:
+                        titles[sid] = one_line(o.get("text", ""))
+        except OSError:
+            return {}
+        _codex_titles_cache.update(mtime=mtime, titles=titles)
+    return _codex_titles_cache["titles"]
+
+
+CODEX_NON_PROMPT = ("# AGENTS.md", "<INSTRUCTIONS>", "<environment_context>",
+                    "<user_instructions>", "<permissions")
+
+
+def codex_first_user_message(path, limit=200):
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                p = o.get("payload") or {}
+                text = None
+                if o.get("type") == "event_msg" and p.get("type") == "user_message":
+                    text = p.get("message")
+                elif o.get("type") == "response_item" and p.get("role") == "user":
+                    c = p.get("content")
+                    if isinstance(c, list):
+                        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    text = str(c or "")
+                if not text:
+                    continue
+                t = text.strip()
+                if any(s in t[:100] for s in CODEX_NON_PROMPT):
+                    continue
+                if one_line(t, limit):
+                    return one_line(t, limit)
+    except OSError:
+        pass
+    return None
+
+
+def external_session_map(procs):
+    """tty -> {'title', 'ts', 'cwd'} for running pi and codex processes."""
+    ext_procs = {tty: p for tty, p in procs.items() if p["kind"] in ("pi", "codex")}
+    meta = proc_meta([p["pid"] for p in ext_procs.values()])
+    by_key = {}
+    for tty, p in ext_procs.items():
         m = meta.get(p["pid"])
         if m and m["cwd"]:
-            by_cwd.setdefault(m["cwd"], []).append((m["start_ts"], tty))
+            by_key.setdefault((p["kind"], m["cwd"]), []).append((m["start_ts"], tty))
+    codex_by_cwd = (
+        codex_session_files()
+        if any(k == "codex" for k, _ in by_key) else {}
+    )
+    titles = codex_titles() if codex_by_cwd else {}
     result = {}
-    for cwd, entries in by_cwd.items():
+    for (kind, cwd), entries in by_key.items():
+        if kind == "pi":
+            files = [(c, mt, path, None) for c, mt, path in pi_session_files(cwd)]
+        else:
+            files = codex_by_cwd.get(cwd, [])
         entries.sort()  # oldest process first
         # newest N files by activity, then pair oldest-created <-> oldest-started
-        files = sorted(pi_session_files(cwd), key=lambda x: -x[1])[: len(entries)]
+        files = sorted(files, key=lambda x: -x[1])[: len(entries)]
         files.sort()
-        for (start_ts, tty), (created, mtime, path) in zip(entries, files):
-            title = pi_first_user_message(path)
+        for (start_ts, tty), (created, mtime, path, sid) in zip(entries, files):
+            if kind == "pi":
+                title = pi_first_user_message(path)
+            else:
+                title = titles.get(sid) or codex_first_user_message(path)
             result[tty] = {
                 "title": title,
                 "ts": mtime,
@@ -290,7 +448,16 @@ def is_spinner(title):
 
 
 def clean_title(title):
-    return title.lstrip("⠀⠁⠂⠄⠈⠐⠠⡀⢀✳✶⚠ ").strip() or title
+    t = (title or "").strip()
+    while t and (0x2800 <= ord(t[0]) <= 0x28FF or t[0] in "✳✶⚠◐◓◑◒"):
+        t = t[1:].lstrip()
+    return t or title
+
+
+def informative_title(title, cwd):
+    """A real task title, not just the project name codex/pi default to."""
+    base = os.path.basename(cwd.rstrip("/")) if cwd else ""
+    return bool(title) and title not in (base, cwd)
 
 
 def one_line(s, limit=200):
@@ -302,7 +469,7 @@ def build_rows():
     procs = agent_processes()
     feed_last, feed_pending, feed_cwds = feed_state()
     notifs = notif_state()
-    pi_map = pi_session_map(procs)
+    ext_map = external_session_map(procs)
 
     rows = []
     seen_ttys = set()
@@ -319,19 +486,27 @@ def build_rows():
             parse_ts(last.get("created_at")) if last else 0.0,
             parse_ts(notif.get("created_at")) if notif else 0.0,
         )
-        pi = pi_map.get(surf["tty"], {})
-        # pi has no feed events; a freshly-appended session file means activity
-        if status == "IDLE" and pi.get("ts") and time.time() - pi["ts"] < 60:
+        ext = ext_map.get(surf["tty"], {})
+        # pi/codex have no feed events; a freshly-written session file means activity
+        if status == "IDLE" and ext.get("ts") and time.time() - ext["ts"] < 60:
             status = "RUNNING"
+        cwd = ext.get("cwd") or feed_cwds.get(wskey, "")
+        stitle = clean_title(surf["title"])
+        # trust the agent's own terminal title (e.g. codex thread-title) when it
+        # carries a task name; fall back to the session file's first prompt
+        if not ext or informative_title(stitle, cwd):
+            title = stitle
+        else:
+            title = ext.get("title") or stitle
         rows.append(
             {
                 "surf": surf,
                 "kind": proc["kind"],
                 "status": status,
                 "detail": one_line(detail),
-                "title": pi.get("title") or clean_title(surf["title"]),
-                "cwd": pi.get("cwd") or feed_cwds.get(wskey, ""),
-                "ts": pi.get("ts") or ts,
+                "title": title,
+                "cwd": cwd,
+                "ts": ext.get("ts") or ts,
                 "in_cmux": True,
             }
         )
@@ -340,16 +515,16 @@ def build_rows():
     for tty, proc in procs.items():
         if tty in seen_ttys:
             continue
-        pi = pi_map.get(tty, {})
+        ext = ext_map.get(tty, {})
         rows.append(
             {
                 "surf": None,
                 "kind": proc["kind"],
                 "status": "IDLE",
                 "detail": f"not in cmux ({tty}, pid {proc['pid']})",
-                "title": pi.get("title") or f"{proc['kind']} on {tty}",
-                "cwd": pi.get("cwd", ""),
-                "ts": pi.get("ts") or 0.0,
+                "title": ext.get("title") or f"{proc['kind']} on {tty}",
+                "cwd": ext.get("cwd", ""),
+                "ts": ext.get("ts") or 0.0,
                 "in_cmux": False,
             }
         )
@@ -497,8 +672,14 @@ BTNS = " ✕tab  ✕ws "  # tab zone [btn_x, btn_x+6), ws zone [btn_x+6, btn_x+1
 CLOSE_LABEL = {"tab": "terminal tab", "ws": "workspace"}
 
 
+TITLE_MAX = 72
+
+
 def row_line(i, r):
-    return f" {i + 1:>2} {BADGE[r['status']][0]} {r['status']:<9} {KIND_LABEL.get(r['kind'], r['kind']):<6} {age_str(r['ts']):>6}  {r['title']}"
+    title = r["title"]
+    if len(title) > TITLE_MAX:
+        title = title[: TITLE_MAX - 1].rstrip() + "…"
+    return f" {i + 1:>2} {BADGE[r['status']][0]} {r['status']:<9} {KIND_LABEL.get(r['kind'], r['kind']):<6} {age_str(r['ts']):>6}  {title}"
 
 
 def btn_col(rows, w):
@@ -539,7 +720,9 @@ def draw(stdscr, rows, selected, msg, confirm=None):
     sel = rows[selected] if rows and 0 <= selected < len(rows) else None
     footer_y = h - 2
     if sel:
-        detail = sel["detail"] or sel["cwd"]
+        detail = sel["detail"] or (
+            sel["title"] if len(sel["title"]) > TITLE_MAX else sel["cwd"]
+        )
         stdscr.addnstr(footer_y, 0, f" {detail}".ljust(w - 1), w - 1, curses.A_DIM)
     keys = " ⏎/click jump   ✕/x close tab   w close workspace   r refresh   q quit "
     if confirm:
@@ -690,6 +873,8 @@ def main():
     sys.stdout.flush()
     try:
         curses.wrapper(tui)
+    except KeyboardInterrupt:
+        pass
     finally:
         release_lock()
 
